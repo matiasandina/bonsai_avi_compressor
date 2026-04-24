@@ -676,21 +676,25 @@ def extract_frame_burst(
     start_frame: int,
     frame_count: int,
     frame_size: int,
+    fps: float,
 ) -> tuple[Optional[list[bytes]], str]:
-    end_frame = start_frame + frame_count - 1
+    if fps <= 0:
+        return None, "Invalid FPS for burst extraction"
+
+    seek_s = max(start_frame / fps, 0.0)
     cmd = [
         "ffmpeg",
         "-v",
         "error",
+        "-ss",
+        f"{seek_s:.6f}",
         "-i",
         str(video_path),
+        "-an",
+        "-sn",
+        "-dn",
         "-vf",
-        (
-            f"select='between(n\\,{start_frame}\\,{end_frame})',"
-            f"scale={frame_size}:{frame_size},format=gray"
-        ),
-        "-vsync",
-        "0",
+        f"scale={frame_size}:{frame_size},format=gray",
         "-frames:v",
         str(frame_count),
         "-f",
@@ -731,12 +735,15 @@ def compare_frame_burst(
     start_frame: int,
     frame_count: int,
     frame_size: int,
+    original_fps: float,
+    compressed_fps: float,
 ) -> tuple[Optional[BurstComparison], str]:
     original_frames, original_error = extract_frame_burst(
         original_video,
         start_frame,
         frame_count,
         frame_size,
+        original_fps,
     )
     if original_frames is None:
         return None, f"original burst extraction failed: {original_error}"
@@ -746,6 +753,7 @@ def compare_frame_burst(
         start_frame,
         frame_count,
         frame_size,
+        compressed_fps,
     )
     if compressed_frames is None:
         return None, f"compressed burst extraction failed: {compressed_error}"
@@ -1178,6 +1186,24 @@ def verify_pair(pair: SourcePair, args: argparse.Namespace) -> VerificationResul
             usable_frames = min(candidate_counts)
             frame_size = max(args.burst_frame_size, 1)
             burst_length = min(max(args.burst_length, 1), usable_frames)
+            if (
+                original_video_stats.fps is None
+                or original_video_stats.fps <= 0
+                or compressed_video_stats.fps is None
+                or compressed_video_stats.fps <= 0
+            ):
+                result.add(
+                    "WARN",
+                    "content-match",
+                    "Skipped burst comparison because video FPS metadata is unavailable.",
+                )
+                progress(
+                    "[yellow]Burst comparison skipped because one file has no usable FPS metadata.[/yellow]"
+                )
+                progress(
+                    f"[dim]Pair verification complete in {format_seconds(time.monotonic() - pair_start)}.[/dim]"
+                )
+                return result
             anchor_starts = build_burst_anchor_starts(
                 usable_frames,
                 burst_length,
@@ -1204,6 +1230,8 @@ def verify_pair(pair: SourcePair, args: argparse.Namespace) -> VerificationResul
                         start_frame,
                         burst_length,
                         frame_size,
+                        original_video_stats.fps,
+                        compressed_video_stats.fps,
                     )
                     if comparison is None:
                         burst_failures.append(f"frame {start_frame}: {detail}")
