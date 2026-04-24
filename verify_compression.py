@@ -12,10 +12,24 @@ import statistics
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.table import Table
 
 
 VIDEO_RE = (
@@ -24,6 +38,7 @@ VIDEO_RE = (
     r"\.(?P<ext>avi|mp4|mov|mkv)$"
 )
 SUPPORTED_VIDEO_EXTS = {".avi", ".mp4", ".mov", ".mkv"}
+console = Console()
 
 
 @dataclass
@@ -107,7 +122,30 @@ class BurstComparison:
 
 
 def progress(message: str) -> None:
-    print(message, flush=True)
+    console.print(message)
+
+
+def format_seconds(seconds: float) -> str:
+    total_seconds = max(int(round(seconds)), 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes:d}m{secs:02d}s"
+    return f"{secs:d}s"
+
+
+def format_eta(
+    completed: int,
+    total: int,
+    elapsed_s: float,
+) -> str:
+    if completed <= 0 or total <= completed:
+        return "eta --"
+    avg_s = elapsed_s / completed
+    remaining_s = avg_s * (total - completed)
+    return f"eta {format_seconds(remaining_s)}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -783,6 +821,7 @@ def pair_inputs(compressed_dir: Path, originals_dir: Path) -> tuple[list[SourceP
 
 def verify_pair(pair: SourcePair, args: argparse.Namespace) -> VerificationResult:
     result = VerificationResult(pair=pair)
+    pair_start = time.monotonic()
 
     if not pair.compressed_video.exists():
         result.add("FAIL", "missing-compressed-video", f"Missing {pair.compressed_video}")
@@ -806,9 +845,9 @@ def verify_pair(pair: SourcePair, args: argparse.Namespace) -> VerificationResul
         )
         return result
 
-    progress("    reading original CSV...")
+    progress("[dim]Reading original CSV...[/dim]")
     original_csv_stats = analyze_csv(pair.original_csv)
-    progress("    reading compressed CSV...")
+    progress("[dim]Reading compressed CSV...[/dim]")
     compressed_csv_stats = analyze_csv(pair.compressed_csv)
 
     if original_csv_stats.sha256 != compressed_csv_stats.sha256:
@@ -906,9 +945,9 @@ def verify_pair(pair: SourcePair, args: argparse.Namespace) -> VerificationResul
                 f"{label} CSV has {stats.duplicate_timestamp_count} duplicate timestamp step(s).",
             )
 
-    progress("    probing compressed video...")
+    progress("[dim]Probing compressed video...[/dim]")
     compressed_video_stats = probe_video(pair.compressed_video)
-    progress("    probing original video...")
+    progress("[dim]Probing original video...[/dim]")
     original_video_stats = probe_video(pair.original_video)
 
     if (
@@ -1073,23 +1112,36 @@ def verify_pair(pair: SourcePair, args: argparse.Namespace) -> VerificationResul
                 args.decode_segments,
             )
             failures: list[str] = []
+            segment_start = time.monotonic()
             total_segments = len(segments)
-            for segment_index, (start_s, segment_duration_s) in enumerate(
-                segments,
-                start=1,
-            ):
-                progress(
-                    f"    partial decode segment {segment_index}/{total_segments}..."
-                )
-                ok, detail = decode_video_segment(
-                    pair.compressed_video,
-                    start_s,
-                    segment_duration_s,
-                )
-                if not ok:
-                    failures.append(
-                        f"{start_s:.3f}s + {segment_duration_s:.3f}s: {detail}"
+            with build_loop_progress() as progress_bar:
+                task_id = progress_bar.add_task("Partial decode", total=total_segments)
+                for segment_index, (start_s, segment_duration_s) in enumerate(
+                    segments,
+                    start=1,
+                ):
+                    progress_bar.update(
+                        task_id,
+                        description=(
+                            f"Partial decode {segment_index}/{total_segments} "
+                            f"({format_seconds(time.monotonic() - segment_start)})"
+                        ),
                     )
+                    ok, detail = decode_video_segment(
+                        pair.compressed_video,
+                        start_s,
+                        segment_duration_s,
+                    )
+                    if not ok:
+                        failures.append(
+                            f"{start_s:.3f}s + {segment_duration_s:.3f}s: {detail}"
+                        )
+                    progress_bar.advance(task_id)
+            if total_segments:
+                progress(
+                    "[dim]Partial decode complete "
+                    f"in {format_seconds(time.monotonic() - segment_start)}.[/dim]"
+                )
             if failures:
                 result.add(
                     "FAIL",
@@ -1133,37 +1185,51 @@ def verify_pair(pair: SourcePair, args: argparse.Namespace) -> VerificationResul
             )
             burst_failures: list[str] = []
             comparisons: list[BurstComparison] = []
+            burst_start = time.monotonic()
             total_anchors = len(anchor_starts)
-            for anchor_index, start_frame in enumerate(anchor_starts, start=1):
+            with build_loop_progress() as progress_bar:
+                task_id = progress_bar.add_task("Burst compare", total=total_anchors)
+                for anchor_index, start_frame in enumerate(anchor_starts, start=1):
+                    burst_elapsed = time.monotonic() - burst_start
+                    progress_bar.update(
+                        task_id,
+                        description=(
+                            f"Burst compare {anchor_index}/{total_anchors} "
+                            f"(frame {start_frame}, {format_seconds(burst_elapsed)})"
+                        ),
+                    )
+                    comparison, detail = compare_frame_burst(
+                        pair.original_video,
+                        pair.compressed_video,
+                        start_frame,
+                        burst_length,
+                        frame_size,
+                    )
+                    if comparison is None:
+                        burst_failures.append(f"frame {start_frame}: {detail}")
+                        progress_bar.advance(task_id)
+                        continue
+                    comparisons.append(comparison)
+                    if comparison.mean_mae > args.burst_mean_mae_threshold:
+                        burst_failures.append(
+                            (
+                                f"frame {start_frame}: burst mean MAE "
+                                f"{comparison.mean_mae:.2f} > {args.burst_mean_mae_threshold:.2f}"
+                            )
+                        )
+                    elif comparison.max_mae > args.burst_max_mae_threshold:
+                        burst_failures.append(
+                            (
+                                f"frame {start_frame}: burst max MAE "
+                                f"{comparison.max_mae:.2f} > {args.burst_max_mae_threshold:.2f}"
+                            )
+                        )
+                    progress_bar.advance(task_id)
+            if total_anchors:
                 progress(
-                    f"    burst comparison {anchor_index}/{total_anchors} "
-                    f"(start frame {start_frame})..."
+                    "[dim]Burst comparison complete "
+                    f"in {format_seconds(time.monotonic() - burst_start)}.[/dim]"
                 )
-                comparison, detail = compare_frame_burst(
-                    pair.original_video,
-                    pair.compressed_video,
-                    start_frame,
-                    burst_length,
-                    frame_size,
-                )
-                if comparison is None:
-                    burst_failures.append(f"frame {start_frame}: {detail}")
-                    continue
-                comparisons.append(comparison)
-                if comparison.mean_mae > args.burst_mean_mae_threshold:
-                    burst_failures.append(
-                        (
-                            f"frame {start_frame}: burst mean MAE "
-                            f"{comparison.mean_mae:.2f} > {args.burst_mean_mae_threshold:.2f}"
-                        )
-                    )
-                elif comparison.max_mae > args.burst_max_mae_threshold:
-                    burst_failures.append(
-                        (
-                            f"frame {start_frame}: burst max MAE "
-                            f"{comparison.max_mae:.2f} > {args.burst_max_mae_threshold:.2f}"
-                        )
-                    )
 
             if burst_failures:
                 result.add(
@@ -1193,32 +1259,139 @@ def verify_pair(pair: SourcePair, args: argparse.Namespace) -> VerificationResul
                 )
 
     if args.full_decode:
-        progress("    running full decode...")
+        full_decode_start = time.monotonic()
+        progress("[dim]Running full decode...[/dim]")
         ok, detail = decode_full_video(pair.compressed_video)
+        progress(
+            "[dim]Full decode complete "
+            f"in {format_seconds(time.monotonic() - full_decode_start)}.[/dim]"
+        )
         if ok:
             result.add("PASS", "full-decode", "Full stream decode succeeded.")
         else:
             result.add("FAIL", "full-decode", detail)
 
+    progress(
+        f"[dim]Pair verification complete in {format_seconds(time.monotonic() - pair_start)}.[/dim]"
+    )
     return result
 
 
 def print_result(result: VerificationResult) -> None:
-    print(f"[{result.status}] {result.pair.compressed_video.name}", flush=True)
-    print(f"  original video: {result.pair.original_video}", flush=True)
-    print(f"  original csv:   {result.pair.original_csv}", flush=True)
-    print(f"  compressed mp4: {result.pair.compressed_video}", flush=True)
-    print(f"  compressed csv: {result.pair.compressed_csv}", flush=True)
-
-    for message in result.messages:
-        if message.severity == "PASS":
-            continue
-        print(f"  {message.severity:<4} {message.code}: {message.detail}", flush=True)
+    status_styles = {
+        "PASS": "green",
+        "WARN": "yellow",
+        "FAIL": "red",
+    }
+    details = Table.grid(padding=(0, 1))
+    details.add_column(style="bold")
+    details.add_column()
+    details.add_row("Original video", str(result.pair.original_video))
+    details.add_row("Original csv", str(result.pair.original_csv))
+    details.add_row("Compressed mp4", str(result.pair.compressed_video))
+    details.add_row("Compressed csv", str(result.pair.compressed_csv))
 
     if result.status == "PASS":
-        print("  PASS all checks", flush=True)
+        details.add_row("Result", "[green]PASS all checks[/green]")
+    else:
+        for message in result.messages:
+            if message.severity == "PASS":
+                continue
+            details.add_row(
+                f"[{message.severity}] {message.code}",
+                message.detail,
+            )
 
-    print(flush=True)
+    console.print(
+        Panel(
+            details,
+            title=f"[{status_styles[result.status]}]{result.status}[/{status_styles[result.status]}] "
+            f"{result.pair.compressed_video.name}",
+            border_style=status_styles[result.status],
+        )
+    )
+
+
+def build_loop_progress() -> Progress:
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=28),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+    )
+
+
+def run_progress_loop(
+    total: int,
+    description_prefix: str,
+    items: list[tuple[int, object]],
+    worker,
+) -> list[tuple[int, object, object]]:
+    results: list[tuple[int, object, object]] = []
+    with build_loop_progress() as progress_bar:
+        task_id = progress_bar.add_task(description_prefix, total=total)
+        for index, payload in items:
+            progress_bar.update(
+                task_id,
+                description=f"{description_prefix} {index}/{total}",
+            )
+            results.append((index, payload, worker(index, payload)))
+            progress_bar.advance(task_id)
+    return results
+
+
+def print_summary(pass_count: int, warn_count: int, fail_count: int) -> None:
+    summary = Table.grid(padding=(0, 2))
+    summary.add_column(style="green")
+    summary.add_column(style="yellow")
+    summary.add_column(style="red")
+    summary.add_row(
+        f"PASS: {pass_count}",
+        f"WARN: {warn_count}",
+        f"FAIL: {fail_count}",
+    )
+    console.print(Panel(summary, title="Summary", border_style="cyan"))
+
+
+def print_header(compressed_dir: Path, originals_dir: Path, matched_pairs: int) -> None:
+    info = Table.grid(padding=(0, 1))
+    info.add_column(style="bold cyan")
+    info.add_column()
+    info.add_row("Compressed dir", str(compressed_dir))
+    info.add_row("Originals dir", str(originals_dir))
+    info.add_row("Matched pairs", str(matched_pairs))
+    console.print(Panel(info, title="Verification", border_style="cyan"))
+
+
+def print_pairing_notes(notes: list[str]) -> None:
+    body = "\n".join(f"- {note}" for note in notes)
+    console.print(Panel(body, title="Pairing Notes", border_style="yellow"))
+
+
+def print_pair_start(index: int, total: int, filename: str) -> None:
+    console.rule(f"[bold blue][{index}/{total}] {filename}[/bold blue]")
+
+
+def print_pair_plan(args: argparse.Namespace) -> None:
+    lines = [
+        "[cyan]CSV integrity[/cyan] and timestamp checks",
+        "[cyan]Video metadata[/cyan] probe against original and CSV",
+    ]
+    if args.decode_coverage_pct > 0:
+        lines.append(
+            f"[cyan]Partial decode[/cyan]: {args.decode_coverage_pct:.2f}% across {args.decode_segments} segment(s)"
+        )
+    if args.burst_anchors > 0 and args.burst_length > 0:
+        lines.append(
+            f"[cyan]Burst compare[/cyan]: {args.burst_anchors} anchor(s) x {args.burst_length} frame(s)"
+        )
+    if args.full_decode:
+        lines.append("[cyan]Full decode[/cyan] enabled")
+    console.print("\n".join(f"  • {line}" for line in lines))
 
 
 def main() -> int:
@@ -1237,37 +1410,20 @@ def main() -> int:
 
     pairs, notes = pair_inputs(compressed_dir, originals_dir)
 
-    progress(f"Compressed dir: {compressed_dir}")
-    progress(f"Originals dir:  {originals_dir}")
-    progress(f"Matched pairs:  {len(pairs)}")
+    print_header(compressed_dir, originals_dir, len(pairs))
     if notes:
-        progress("\nPairing notes:")
-        for note in notes:
-            progress(f"  - {note}")
+        print_pairing_notes(notes)
 
     if not pairs:
-        progress("\nNo matching compressed/original pairs found.")
+        console.print("[red]No matching compressed/original pairs found.[/red]")
         return 1
 
-    print(flush=True)
+    console.print()
     results: list[VerificationResult] = []
     total_pairs = len(pairs)
     for index, pair in enumerate(pairs, start=1):
-        progress(f"[{index}/{total_pairs}] Verifying {pair.compressed_video.name}")
-        progress("  checking CSV integrity and timestamps...")
-        progress("  probing original and compressed video metadata...")
-        if args.decode_coverage_pct > 0:
-            progress(
-                f"  partial decode enabled: {args.decode_coverage_pct:.2f}% across "
-                f"{args.decode_segments} segment(s)"
-            )
-        if args.burst_anchors > 0 and args.burst_length > 0:
-            progress(
-                f"  comparing {args.burst_anchors} frame burst(s) of "
-                f"{args.burst_length} frame(s) each..."
-            )
-        if args.full_decode:
-            progress("  full decode enabled...")
+        print_pair_start(index, total_pairs, pair.compressed_video.name)
+        print_pair_plan(args)
         result = verify_pair(pair, args)
         results.append(result)
         print_result(result)
@@ -1276,21 +1432,18 @@ def main() -> int:
     warn_count = sum(result.status == "WARN" for result in results)
     fail_count = sum(result.status == "FAIL" for result in results)
 
-    progress("Summary")
-    progress(f"  PASS: {pass_count}")
-    progress(f"  WARN: {warn_count}")
-    progress(f"  FAIL: {fail_count}")
+    print_summary(pass_count, warn_count, fail_count)
 
     if fail_count:
-        progress("\nAt least one compressed output failed verification.")
+        console.print("[red]At least one compressed output failed verification.[/red]")
         return 1
 
     if warn_count:
-        progress(
-            "\nVerification passed with warnings. Review the WARN items before deleting originals."
+        console.print(
+            "[yellow]Verification passed with warnings. Review the WARN items before deleting originals.[/yellow]"
         )
     else:
-        progress("\nAll matched outputs passed verification.")
+        console.print("[green]All matched outputs passed verification.[/green]")
     return 0
 
 

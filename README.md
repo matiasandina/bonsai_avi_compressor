@@ -13,7 +13,7 @@ Utilities for rewriting Bonsai-recorded AVI files to MP4 with corrected playback
 
 - Python `>=3.11`
 - `ffmpeg` and `ffprobe` available on `PATH`
-- Python dependency: `pandas>=3.2`
+- Python dependencies: `pandas>=3.0.2`, `rich>=13.9`
 
 ## Setup
 
