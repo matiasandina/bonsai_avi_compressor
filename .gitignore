@@ -1,0 +1,6 @@
+.codex
+.venv/
+__pycache__/
+*.py[cod]
+compressed/
+

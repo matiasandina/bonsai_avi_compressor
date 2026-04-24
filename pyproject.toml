@@ -1,0 +1,12 @@
+[project]
+name = "bonsai-avi-compressor"
+version = "0.1.0"
+description = "Tools to rewrite/compress Bonsai AVI recordings and verify compressed outputs"
+readme = "README.md"
+authors = [
+    { name = "Matias Andina", email = "matiasandina@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=3.0.2",
+]
