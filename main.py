@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 import batch_fix_video_timing
 import fix_video_timing
+import relocate_compressed_videos
 import verify_compression
 
 
@@ -62,6 +63,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Arguments passed through to verify_compression.py",
     )
 
+    relocate_parser = subparsers.add_parser(
+        "relocate",
+        help="Move compressed outputs into matching session rawvideo folders",
+    )
+    relocate_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to relocate_compressed_videos.py",
+    )
+
     return parser
 
 
@@ -91,6 +102,13 @@ def cli() -> int:
         return dispatch(
             "verify_compression.py",
             verify_compression.main,
+            forwarded_args,
+        )
+
+    if parsed.command == "relocate":
+        return dispatch(
+            "relocate_compressed_videos.py",
+            relocate_compressed_videos.main,
             forwarded_args,
         )
 

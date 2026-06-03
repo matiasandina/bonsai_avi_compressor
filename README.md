@@ -7,6 +7,7 @@ Utilities for rewriting Bonsai-recorded AVI files to MP4 with corrected playback
 - `main.py`: wrapper entrypoint for the repo. Use this as the top-level interface.
 - `batch_fix_video_timing.py`: batch compressor for a folder of timestamped videos and matching CSV files.
 - `fix_video_timing.py`: single-video analysis and rewrite helper.
+- `relocate.py`: moves timestamped compressed outputs into matching session `rawvideo/` folders.
 - `verify_compression.py`: verification script that checks compressed outputs against archived originals.
 
 ## Requirements
@@ -94,8 +95,34 @@ Optional stronger corruption checks:
 - `--decode-coverage-pct <pct>`: decode evenly spaced chunks from each MP4
 - `--full-decode`: decode the entire MP4 stream end-to-end
 
+### 4. Relocate compressed outputs to session folders
+
+Move compressed outputs from one root's `compressed/` folder into matching session folders under another root. The script creates `rawvideo/` inside the matched session folder.
+
+```bash
+uv run ./relocate.py --source-dir root_path1/compressed --target-root root_path2
+```
+
+By default, the session date matches the recording date:
+
+```text
+root_path1/compressed/2026-05-29T*.mp4
+root_path1/compressed/2026-05-29T*.csv
+root_path1/compressed/2026-05-29T*.csv.gz
+  -> root_path2/2026_05_29*/rawvideo/
+```
+
+Useful options:
+
+- `--dry-run`: print planned moves without creating folders or moving files
+- `--session-date-offset-days -1`: match `2026-05-29T*` to `2026_05_28*`
+- `--session-date-offset-days 1`: match `2026-05-29T*` to `2026_05_30*`
+- `--overwrite`: replace existing files in the destination `rawvideo/`
+- `--allow-ambiguous`: if more than one session folder matches a date prefix, use the first sorted match
+
 ## Suggested Usage Order
 
 1. Run `compress` to create MP4 and `csv.gz` outputs.
 2. Run `verify` against `compressed/` and `compressed/originals/`.
-3. Delete archived originals only after verification passes.
+3. Run `relocate.py` with `--dry-run`, then without `--dry-run` after confirming the targets.
+4. Delete archived originals only after verification passes.
