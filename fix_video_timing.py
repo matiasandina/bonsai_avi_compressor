@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -188,6 +189,68 @@ def infer_matching_csv(video_path: Path) -> Path:
         return csv_gz_path
 
     return csv_path
+
+
+def parse_video_identity(path: Path) -> tuple[str, datetime] | None:
+    match = VIDEO_RE.match(path.name)
+    if not match:
+        return None
+    timestamp = datetime.strptime(match.group("ts"), "%Y-%m-%dT%H_%M_%S")
+    return match.group("prefix"), timestamp
+
+
+def find_nearby_csv_candidate(
+    video_path: Path,
+    *,
+    tolerance_s: float = 1.0,
+) -> Path | None:
+    identity = parse_video_identity(video_path)
+    if identity is None:
+        return None
+
+    video_prefix, video_ts = identity
+    candidates: list[tuple[float, Path]] = []
+    for csv_path in video_path.parent.glob(f"{video_prefix}_*.csv*"):
+        csv_stem = csv_path.name
+        if csv_stem.endswith(".csv.gz"):
+            csv_stem = csv_stem[:-7]
+        elif csv_stem.endswith(".csv"):
+            csv_stem = csv_stem[:-4]
+        else:
+            continue
+
+        fake_video_name = f"{csv_stem}.avi"
+        csv_identity = parse_video_identity(csv_path.with_name(fake_video_name))
+        if csv_identity is None:
+            continue
+        csv_prefix, csv_ts = csv_identity
+        if csv_prefix != video_prefix:
+            continue
+
+        delta_s = abs((csv_ts - video_ts).total_seconds())
+        if delta_s <= tolerance_s:
+            candidates.append((delta_s, csv_path))
+
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: (item[0], item[1].name))[0][1]
+
+
+def missing_csv_message(video_path: Path, expected_csv: Path) -> str:
+    nearby = find_nearby_csv_candidate(video_path)
+    if nearby is None:
+        return (
+            f"missing timestamp CSV: expected {expected_csv}. "
+            "Provide --fps to compress without CSV timing, or place the matching CSV next to the video."
+        )
+
+    suggested_name = expected_csv.name
+    return (
+        f"missing timestamp CSV: expected {expected_csv}. "
+        f"Found a likely 1-second timestamp mismatch: {nearby}. "
+        f"Fix: if this CSV belongs to the video, rename it to {suggested_name} "
+        "or pass it explicitly with --csv."
+    )
 
 
 def analyze(video_path: Path, csv_path: Path) -> VideoStats:
@@ -411,6 +474,9 @@ def main() -> None:
     video_path = args.video
 
     csv_path = args.csv if args.csv else infer_matching_csv(video_path)
+
+    if not csv_path.exists() and args.fps is None:
+        raise RuntimeError(missing_csv_message(video_path, csv_path))
 
     stats = analyze(video_path, csv_path)
 

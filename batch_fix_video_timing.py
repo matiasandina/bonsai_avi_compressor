@@ -13,6 +13,7 @@ from fix_video_timing import (
     build_prefixed_name,
     build_rewrite_plan,
     infer_matching_csv,
+    missing_csv_message,
     print_report,
     rewrite_and_compress,
     write_gzipped_csv_copy,
@@ -124,6 +125,13 @@ def process_video(
 ) -> BatchResult:
     csv_path = infer_matching_csv(video_path)
     output_video, output_csv = build_output_paths(video_path, output_dir)
+
+    if not csv_path.exists() and fps is None:
+        return BatchResult(
+            video_path,
+            "failed",
+            missing_csv_message(video_path, csv_path),
+        )
 
     if adopt_existing:
         adopted = adopt_existing_output(
