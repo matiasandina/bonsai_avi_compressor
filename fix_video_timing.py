@@ -54,6 +54,12 @@ class RewritePlan:
     pts_factor: float
 
 
+@dataclass
+class NearbyCsvCandidate:
+    path: Path
+    delta_s: float
+
+
 def run_cmd(cmd: list[str]) -> subprocess.CompletedProcess:
 
     return subprocess.run(cmd, check=True, text=True, capture_output=True)
@@ -203,13 +209,13 @@ def find_nearby_csv_candidate(
     video_path: Path,
     *,
     tolerance_s: float = 1.0,
-) -> Path | None:
+) -> NearbyCsvCandidate | None:
     identity = parse_video_identity(video_path)
     if identity is None:
         return None
 
     video_prefix, video_ts = identity
-    candidates: list[tuple[float, Path]] = []
+    candidates: list[tuple[float, float, Path]] = []
     for csv_path in video_path.parent.glob(f"{video_prefix}_*.csv*"):
         csv_stem = csv_path.name
         if csv_stem.endswith(".csv.gz"):
@@ -227,29 +233,38 @@ def find_nearby_csv_candidate(
         if csv_prefix != video_prefix:
             continue
 
-        delta_s = abs((csv_ts - video_ts).total_seconds())
-        if delta_s <= tolerance_s:
-            candidates.append((delta_s, csv_path))
+        signed_delta_s = (csv_ts - video_ts).total_seconds()
+        abs_delta_s = abs(signed_delta_s)
+        if abs_delta_s <= tolerance_s:
+            candidates.append((abs_delta_s, signed_delta_s, csv_path))
 
     if not candidates:
         return None
-    return sorted(candidates, key=lambda item: (item[0], item[1].name))[0][1]
+    _abs_delta_s, signed_delta_s, csv_path = sorted(
+        candidates,
+        key=lambda item: (item[0], item[2].name),
+    )[0]
+    return NearbyCsvCandidate(path=csv_path, delta_s=signed_delta_s)
 
 
 def missing_csv_message(video_path: Path, expected_csv: Path) -> str:
     nearby = find_nearby_csv_candidate(video_path)
     if nearby is None:
         return (
-            f"missing timestamp CSV: expected {expected_csv}. "
-            "Provide --fps to compress without CSV timing, or place the matching CSV next to the video."
+            "Missing timestamp CSV.\n"
+            f"  expected: {expected_csv}\n"
+            "  likely issue: no same-prefix CSV was found within 1 second of the AVI timestamp\n"
+            "  fix: place the matching CSV next to the video, or provide --fps to compress without CSV timing"
         )
 
     suggested_name = expected_csv.name
+    delta_direction = "after" if nearby.delta_s > 0 else "before"
     return (
-        f"missing timestamp CSV: expected {expected_csv}. "
-        f"Found a likely 1-second timestamp mismatch: {nearby}. "
-        f"Fix: if this CSV belongs to the video, rename it to {suggested_name} "
-        "or pass it explicitly with --csv."
+        "Missing timestamp CSV, but found a likely filename timestamp mismatch.\n"
+        f"  expected:  {expected_csv}\n"
+        f"  candidate: {nearby.path}\n"
+        f"  mismatch:  CSV filename is {abs(nearby.delta_s):.0f}s {delta_direction} the AVI filename\n"
+        f"  fix:       if this CSV belongs to the video, rename it to {suggested_name}"
     )
 
 

@@ -7,13 +7,18 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
 from fix_video_timing import (
     VIDEO_RE,
+    NearbyCsvCandidate,
     analyze,
     build_prefixed_name,
     build_rewrite_plan,
+    find_nearby_csv_candidate,
     infer_matching_csv,
-    missing_csv_message,
     print_report,
     rewrite_and_compress,
     write_gzipped_csv_copy,
@@ -21,6 +26,7 @@ from fix_video_timing import (
 
 
 SUPPORTED_EXTS = {".avi", ".mp4", ".mov", ".mkv"}
+console = Console()
 
 
 @dataclass
@@ -28,6 +34,56 @@ class BatchResult:
     video: Path
     status: str
     detail: str
+    expected_csv: Path | None = None
+    nearby_csv: NearbyCsvCandidate | None = None
+
+
+def render_result(result: BatchResult) -> None:
+    if result.status == "failed" and result.expected_csv is not None:
+        table = Table.grid(padding=(0, 1))
+        table.add_column(style="bold")
+        table.add_column()
+        table.add_row("Video", result.video.name)
+        table.add_row("Expected CSV", str(result.expected_csv))
+
+        if result.nearby_csv is not None:
+            direction = "after" if result.nearby_csv.delta_s > 0 else "before"
+            table.add_row("Likely CSV", str(result.nearby_csv.path))
+            table.add_row(
+                "Mismatch",
+                (
+                    f"CSV filename is {abs(result.nearby_csv.delta_s):.0f}s "
+                    f"{direction} the AVI filename"
+                ),
+            )
+            table.add_row(
+                "Fix",
+                f"If this CSV belongs to the video, rename it to {result.expected_csv.name}",
+            )
+        else:
+            table.add_row(
+                "Likely issue",
+                "No same-prefix CSV was found within 1 second of the AVI timestamp",
+            )
+            table.add_row(
+                "Fix",
+                "Place the matching CSV next to the video, or provide --fps to compress without CSV timing",
+            )
+
+        console.print(
+            Panel(
+                table,
+                title="[bold red]Missing timestamp CSV[/bold red]",
+                border_style="red",
+                expand=False,
+            )
+        )
+        return
+
+    style = "red" if result.status == "failed" else "green"
+    console.print(
+        f"[{style}][{result.status}][/{style}] {result.video.name}: {result.detail}"
+    )
 
 
 def iter_source_videos(folder: Path) -> list[Path]:
@@ -130,7 +186,9 @@ def process_video(
         return BatchResult(
             video_path,
             "failed",
-            missing_csv_message(video_path, csv_path),
+            "missing timestamp CSV",
+            expected_csv=csv_path,
+            nearby_csv=find_nearby_csv_candidate(video_path),
         )
 
     if adopt_existing:
@@ -285,10 +343,10 @@ def main() -> None:
         print(f"No matching source videos found in {folder}")
         return
 
-    print(f"Found {len(videos)} source video(s) in {folder}")
-    print(f"Compressed outputs will go to {output_dir}")
+    console.print(f"Found {len(videos)} source video(s) in {folder}")
+    console.print(f"Compressed outputs will go to {output_dir}")
     if args.archive_originals:
-        print(f"Original inputs will be archived to {archive_dir}")
+        console.print(f"Original inputs will be archived to {archive_dir}")
 
     results: list[BatchResult] = []
     for video_path in videos:
@@ -310,7 +368,7 @@ def main() -> None:
             result = BatchResult(video_path, "failed", str(exc))
 
         results.append(result)
-        print(f"[{result.status}] {result.video.name}: {result.detail}")
+        render_result(result)
 
     print(f"\n{'=' * 80}")
     for status in ("processed", "adopted", "skipped", "dry-run", "failed"):
